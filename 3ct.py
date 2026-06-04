@@ -1,261 +1,231 @@
+"""
+PINN comparison for regularized Abel transform (CT reconstruction).
+
+Equation:  mu(r) = f(r) + lambda * int_0^1 K(r,s) mu(s) ds
+Kernel:    K(r,s) = 2s / sqrt((r+eps)^2 + s^2),  eps=0.05,  lambda=0.5
+Solution:  mu*(s) = s(1-s)
+"""
+
 import torch
 import torch.nn as nn
 import numpy as np
 import matplotlib.pyplot as plt
 import warnings
-from scipy import integrate, optimize
+from scipy import integrate
 import os
 
 warnings.filterwarnings('ignore')
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
-DTYPE = torch.float32
+DTYPE = torch.float64
 
 output_folder = 'abel_ct_figures'
 os.makedirs(output_folder, exist_ok=True)
 
+print(f"Device: {device}")
+print("Equation: mu(r) = f(r) + 0.5 * int_0^1 K(r,s) mu(s) ds")
+print("Kernel:   K(r,s) = 2s / sqrt((r+0.05)^2 + s^2)")
+print("Exact solution: mu*(s) = s(1-s)")
 
-def find_alpha(eps=0.05, lam=0.2):
+EPS = 0.05
+LAM = 0.5
+
+
+# ---------------------------------------------------------------------------
+# Problem setup
+# ---------------------------------------------------------------------------
+
+def kernel(r, s):
+    return 2 * s / np.sqrt((r + EPS) ** 2 + s ** 2)
+
+
+def true_sol(s):
+    return s * (1 - s)
+
+
+def compute_source(r, N_quad=1000):
+    """f(r) = mu*(r) - lam * int_0^1 K(r,s) mu*(s) ds."""
+    s = np.linspace(0, 1, N_quad)
+    integrand = kernel(r, s) * true_sol(s)
+    return true_sol(r) - LAM * np.trapz(integrand, s)
+
+
+def verify_solution(N_test=10):
+    """Check max residual of exact solution."""
+    xs = np.linspace(0.05, 0.95, N_test)
+    max_res = 0.0
+    for r in xs:
+        integ, _ = integrate.quad(lambda s: kernel(r, s) * true_sol(s), 0, 1, limit=200)
+        res = abs(true_sol(r) - compute_source(r) - LAM * integ)
+        max_res = max(max_res, res)
+    print(f"Verification residual: {max_res:.2e}")
+    return max_res
+
+
+# ---------------------------------------------------------------------------
+# Kernel matrix construction
+# ---------------------------------------------------------------------------
+
+def build_kernel_matrix(N, method):
     """
-    Numerically find the correction factor alpha such that
-    mu(r) = r*(1-r)*(1+alpha) approximately satisfies
-        mu(r) = r*(1-r) + lam * integral_0^1 K(r,s)*mu(s) ds
-    where K(r,s) = 2s / sqrt((r+eps)^2 + s^2).
+    Build lambda*K matrix for PINN residual.
+    method: 'discrete' | 'endpoint' | 'midpoint'
     """
-    def kernel(r, s):
-        return 2 * s / np.sqrt((r + eps) ** 2 + s ** 2)
+    xn = np.linspace(0, 1, N)
+    h  = 1.0 / (N - 1)
+    K  = np.zeros((N, N))
 
-    def residual(alpha):
-        total = 0.0
-        for r in np.linspace(0.1, 0.9, 30):
-            val, _ = integrate.quad(
-                lambda s: kernel(r, s) * r * (1 - r) * (1 + alpha), 0, 1, limit=100)
-            lhs = r * (1 - r) * (1 + alpha)
-            rhs = r * (1 - r) + lam * val
-            total += (lhs - rhs) ** 2
-        return np.sqrt(total / 30)
+    if method == 'discrete':
+        for i in range(N):
+            for j in range(N):
+                K[i, j] = kernel(xn[i], xn[j]) * h
 
-    res = optimize.minimize_scalar(residual, bounds=(0, 1), method='bounded')
-    print(f"Optimal alpha = {res.x:.6f}  (residual = {res.fun:.2e})")
-    return res.x
+    elif method == 'endpoint':
+        for i in range(N):
+            for j in range(N):
+                K[i, j] = kernel(xn[i], xn[j]) * h
+        K[:, 0]  *= 0.5
+        K[:, -1] *= 0.5
 
+    elif method == 'midpoint':
+        hm = 1.0 / N
+        for i in range(N):
+            for j in range(N):
+                tm = min((j + 0.5) * hm, 1.0)
+                K[i, j] = kernel(xn[i], tm) * hm
 
-def create_equation():
-    """
-    Regularized Abel transform equation:
-        mu(r) = r*(1-r) + lam * integral_0^1 K(r,s)*mu(s) ds
-        K(r,s) = 2s / sqrt((r+eps)^2 + s^2),  eps=0.05,  lam=0.2
-    Approximate solution: mu(r) = r*(1-r)*(1+alpha)
-    """
-    eps, lam = 0.05, 0.2
-    alpha = find_alpha(eps, lam)
-    print(f"Equation: mu(r) = r(1-r) + {lam}*int_0^1 K(r,s)*mu(s) ds")
-    print(f"Approximate solution: mu(r) = r(1-r)*(1+{alpha:.6f})")
-    return {
-        'lambda':  lam,
-        'eps':     eps,
-        'alpha':   alpha,
-        'kernel':  lambda r, s: 2 * s / np.sqrt((r + eps) ** 2 + s ** 2),
-        'source':  lambda r: r * (1 - r),
-        'exact':   lambda r: r * (1 - r) * (1 + alpha),
-    }
+    K *= LAM
+    return torch.tensor(K, dtype=DTYPE, device=device)
 
 
-def build_kernel_matrices(N, eq):
-    """
-    Build kernel matrices for three discretization methods.
+# ---------------------------------------------------------------------------
+# Network
+# ---------------------------------------------------------------------------
 
-    Returns list of (method_name, A_matrix, K_matrix) where A = I - K.
-    """
-    kernel, lam = eq['kernel'], eq['lambda']
-    dr = 1.0 / (N - 1)
-    r = np.linspace(0, 1, N)
-
-    # Endpoint method (Simpson's rule)
-    K1 = torch.zeros(N, N, dtype=DTYPE)
-    N_use = N - 1 if N % 2 == 0 else N
-    for i in range(N):
-        for j in range(N_use):
-            if j == 0 or j == N_use - 1:
-                w = dr / 3
-            elif j % 2 == 1:
-                w = 4 * dr / 3
-            else:
-                w = 2 * dr / 3
-            K1[i, j] = kernel(r[i], r[j]) * w
-        if N % 2 == 0:
-            K1[i, N - 1]  = kernel(r[i], r[N - 1]) * dr / 2
-            K1[i, N - 2] += kernel(r[i], r[N - 2]) * dr / 2
-    K1 *= lam
-
-    # Discrete coordinate method (composite trapezoidal rule)
-    K2 = torch.zeros(N, N, dtype=DTYPE)
-    for i in range(N):
-        for j in range(N):
-            w = 0.5 * dr if (j == 0 or j == N - 1) else dr
-            K2[i, j] = kernel(r[i], r[j]) * w
-    K2 *= lam
-
-    # Midpoint method (composite midpoint rule, 3 sub-intervals per panel)
-    K3 = torch.zeros(N, N, dtype=DTYPE)
-    for i in range(N):
-        for j in range(N):
-            if j == 0:
-                s_l, s_r = 0.0, dr / 2
-            elif j == N - 1:
-                s_l, s_r = 1.0 - dr / 2, 1.0
-            else:
-                s_l, s_r = r[j] - dr / 2, r[j] + dr / 2
-            n_sub = 3
-            w = (s_r - s_l) / n_sub
-            K3[i, j] = sum(kernel(r[i], s_l + (k + 0.5) * w) * w for k in range(n_sub))
-    K3 *= lam
-
-    I = torch.eye(N, dtype=DTYPE)
-    configs = [
-        ('Endpoint',        I - K1 + 1e-8 * I, K1),
-        ('Discrete Coord.', I - K2 + 1e-9 * I, K2),
-        ('Midpoint',        I - K3 + 1e-8 * I, K3),
-    ]
-
-    for name, A, _ in configs:
-        print(f"Condition number ({name}): {torch.linalg.cond(A).item():.2e}")
-
-    return configs
-
-
-class AbelPINN(nn.Module):
-    """
-    Residual network for the Abel equation.
-    Boundary condition mu(0) = mu(1) = 0 is enforced by construction.
-    """
-    def __init__(self, width=200, depth=6):
+class PINN(nn.Module):
+    """5-layer x 512-width fully connected network with Tanh activations."""
+    def __init__(self, width=512, depth=5):
         super().__init__()
-        self.input_layer = nn.Linear(1, width)
-        self.blocks = nn.ModuleList([
-            nn.Sequential(nn.Linear(width, width), nn.Tanh(), nn.Linear(width, width))
-            for _ in range(depth // 2)
-        ])
-        self.output_layer = nn.Linear(width, 1)
-        for m in self.modules():
+        layers = [nn.Linear(1, width), nn.Tanh()]
+        for _ in range(depth - 1):
+            layers += [nn.Linear(width, width), nn.Tanh()]
+        layers.append(nn.Linear(width, 1))
+        self.net = nn.Sequential(*layers)
+        for m in self.net:
             if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight, gain=0.5)
+                nn.init.xavier_normal_(m.weight)
                 nn.init.zeros_(m.bias)
 
-    def forward(self, r):
-        x = torch.tanh(self.input_layer(r))
-        for block in self.blocks:
-            x = torch.tanh(block(x)) + 0.5 * x
-        return self.output_layer(x) * r * (1 - r) * 4
+    def forward(self, x):
+        return self.net(x)
 
 
-def train(eq, A, K, method_name, N=100, epochs=5000):
-    r_pts = torch.linspace(0, 1, N, device=device, dtype=DTYPE).unsqueeze(-1)
-    f_vals = torch.tensor(
-        [eq['source'](r.item()) for r in r_pts.squeeze()],
-        device=device, dtype=DTYPE).unsqueeze(-1)
-    true_vals = torch.tensor(
-        [eq['exact'](r.item()) for r in r_pts.squeeze()],
-        device=device, dtype=DTYPE).unsqueeze(-1)
+# ---------------------------------------------------------------------------
+# Training
+# ---------------------------------------------------------------------------
 
-    K_dev = K.to(device)
-    model = AbelPINN(width=200, depth=6).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=0.005, weight_decay=1e-5)
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer, max_lr=0.01, epochs=epochs, steps_per_epoch=1,
-        pct_start=0.3, anneal_strategy='cos')
+def train(method, N=100, epochs=3000, lr=4e-4):
+    xn  = np.linspace(0, 1, N)
+    Km  = build_kernel_matrix(N, method)
 
-    loss_hist, error_hist = [], []
-    best_error = float('inf')
-    best_state = None
-    patience = 0
+    xpts = torch.tensor(xn, dtype=DTYPE, device=device).unsqueeze(-1)
+    fv   = torch.tensor([compute_source(r) for r in xn],
+                        dtype=DTYPE, device=device).unsqueeze(-1)
+    tv   = torch.tensor([true_sol(r) for r in xn],
+                        dtype=DTYPE, device=device).unsqueeze(-1)
+
+    model = PINN(512, 5).double().to(device)
+    opt   = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5)
+    sch   = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs, eta_min=1e-6)
+
+    loss_history, error_history = [], []
+    best_state, best_error = None, float('inf')
 
     for ep in range(1, epochs + 1):
         model.train()
-        optimizer.zero_grad()
-
-        mu = model(r_pts)
-        phys_res = mu - f_vals - torch.matmul(K_dev, mu)
-        phys_loss = phys_res.pow(2).mean()
-        data_loss = (mu - true_vals).pow(2).mean()
-        smooth_loss = (mu[1:] - mu[:-1]).pow(2).mean() if N > 2 else torch.tensor(0.0)
-
-        if ep < 1000:
-            loss = phys_loss + 0.01 * data_loss + 0.001 * smooth_loss
-        elif ep < 3000:
-            loss = phys_loss + 0.1 * data_loss + 1e-4 * smooth_loss
-        else:
-            loss = phys_loss + 0.5 * data_loss
-
+        opt.zero_grad()
+        mu   = model(xpts)
+        loss = (mu - fv - Km @ mu).pow(2).mean()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
-        scheduler.step()
+        opt.step()
+        sch.step()
 
-        loss_hist.append(phys_loss.item())
+        loss_history.append(loss.item())
         with torch.no_grad():
-            err = (mu - true_vals).abs().max().item()
-            error_hist.append(err)
+            err = (mu - tv).abs().max().item()
+            error_history.append(err)
             if err < best_error:
                 best_error = err
                 best_state = {k: v.clone() for k, v in model.state_dict().items()}
-                patience = 0
-            else:
-                patience += 1
 
-        if ep % 1000 == 0:
-            print(f"  [{method_name}] epoch {ep}: "
-                  f"loss={phys_loss.item():.2e}, error={err:.2e}")
+        if ep % 500 == 0:
+            print(f"  [{method:10s}] ep {ep:5d}: loss={loss.item():.3e}, err={err:.3e}")
 
-        if patience > 500 and ep > 2000:
-            print(f"  [{method_name}] early stop at epoch {ep}")
-            break
-
-    if best_state is not None:
+    if best_state:
         model.load_state_dict(best_state)
 
     model.eval()
-    r_test = torch.linspace(0, 1, 300, device=device, dtype=DTYPE).unsqueeze(-1)
+    r_test = torch.linspace(0, 1, 300, dtype=DTYPE, device=device).unsqueeze(-1)
     with torch.no_grad():
         mu_pred = model(r_test).cpu().numpy().flatten()
-        mu_phys = model(r_pts)
-        phys_err = (mu_phys - f_vals - torch.matmul(K_dev, mu_phys)).abs().max().item()
 
-    r_np   = r_test.cpu().numpy().flatten()
-    mu_ex  = np.array([eq['exact'](r) for r in r_np])
+    r_np  = r_test.cpu().numpy().flatten()
+    mu_ex = np.array([true_sol(r) for r in r_np])
+
     max_err  = np.max(np.abs(mu_pred - mu_ex))
     mean_err = np.mean(np.abs(mu_pred - mu_ex))
-    rel_err  = max_err / (np.max(np.abs(mu_ex)) + 1e-8)
+    rel_l2   = (np.sqrt(np.mean((mu_pred - mu_ex) ** 2))
+                / (np.sqrt(np.mean(mu_ex ** 2)) + 1e-15))
+    mse      = np.mean((mu_pred - mu_ex) ** 2)
 
-    print(f"  [{method_name}] max={max_err:.3e}, mean={mean_err:.3e}, "
-          f"rel={rel_err:.3e}, phys={phys_err:.3e}")
+    # PSNR (peak = max of true solution = 0.25)
+    peak = np.max(np.abs(mu_ex))
+    psnr = 20 * np.log10(peak / (np.sqrt(mse) + 1e-15))
 
+    Im   = torch.eye(N, dtype=DTYPE, device=device)
+    cond = torch.linalg.cond(Im - Km).item()
+
+    print(f"  [{method:10s}] max={max_err:.3e}, rel_l2={rel_l2:.3e}, "
+          f"mse={mse:.3e}, PSNR={psnr:.1f} dB, cond={cond:.2e}")
+
+    name_map = {
+        'discrete': 'Discrete Coord.',
+        'endpoint': 'Endpoint',
+        'midpoint': 'Midpoint',
+    }
     return {
-        'method':        method_name,
+        'method':        name_map[method],
         'max_error':     max_err,
         'mean_error':    mean_err,
-        'rel_error':     rel_err,
-        'phys_error':    phys_err,
-        'best_error':    best_error,
-        'loss_history':  loss_hist,
-        'error_history': error_hist,
+        'rel_l2':        rel_l2,
+        'mse':           mse,
+        'psnr':          psnr,
+        'phys_residual': loss_history[-1],
+        'cond':          cond,
+        'loss_history':  loss_history,
+        'error_history': error_history,
         'predictions':   mu_pred,
-        'r_test':        r_np,
+        'r':             r_np,
         'exact':         mu_ex,
     }
 
 
-def plot_results(results, eq):
-    colors = ['blue', 'red', 'green']
-    r_test = results[0]['r_test']
-    exact  = results[0]['exact']
+# ---------------------------------------------------------------------------
+# Plots
+# ---------------------------------------------------------------------------
 
-    # Solution profiles
+def plot_results(results):
+    colors  = ['#0072B2', '#D55E00', '#009E73']
+    r_test  = results[0]['r']
+    exact   = results[0]['exact']
+
+    # Reconstruction profiles
     fig, ax = plt.subplots(figsize=(8, 5))
-    ax.plot(r_test, exact, 'k-', lw=2.5, label='Exact: $r(1-r)(1+\\alpha)$')
+    ax.plot(r_test, exact, 'k-', lw=2.5, label='Exact: $s(1-s)$')
     for i, r in enumerate(results):
         ax.plot(r_test, r['predictions'], color=colors[i], ls='--', lw=2,
-                label=f"{r['method']} (rel={r['rel_error']:.1e})")
+                label=f"{r['method']} (PSNR={r['psnr']:.1f} dB)")
     ax.set_xlabel('r')
     ax.set_ylabel(r'$\mu(r)$')
     ax.set_title('Abel CT reconstruction ($N=100$)')
@@ -270,11 +240,11 @@ def plot_results(results, eq):
     fig, ax = plt.subplots(figsize=(8, 5))
     for i, r in enumerate(results):
         ep = np.arange(1, len(r['loss_history']) + 1)
-        ax.semilogy(ep[::50], r['loss_history'][::50],
+        ax.semilogy(ep[::10], r['loss_history'][::10],
                     color=colors[i], lw=2, label=r['method'])
     ax.set_xlabel('Epoch')
     ax.set_ylabel('Physics residual loss')
-    ax.set_title('Training loss convergence: Abel CT ($N=100$)')
+    ax.set_title('Training loss: Abel CT ($N=100$)')
     ax.legend(fontsize=10)
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
@@ -282,41 +252,31 @@ def plot_results(results, eq):
                 dpi=300, bbox_inches='tight')
     plt.close(fig)
 
-    # Pointwise error
-    fig, ax = plt.subplots(figsize=(8, 5))
-    for i, r in enumerate(results):
-        err = np.abs(r['predictions'] - r['exact']) + 1e-10
-        ax.semilogy(r_test, err, color=colors[i], lw=2, label=r['method'])
-    ax.set_xlabel('r')
-    ax.set_ylabel('Absolute error')
-    ax.set_title('Pointwise error: Abel CT ($N=100$)')
-    ax.legend(fontsize=10)
-    ax.grid(True, alpha=0.3)
-    fig.tight_layout()
-    fig.savefig(os.path.join(output_folder, 'error_distribution_N100.png'),
-                dpi=300, bbox_inches='tight')
-    plt.close(fig)
+    # Summary table
+    print("\nResults summary (Abel CT, N=100):")
+    print(f"{'Method':<18} {'Max Err':>12} {'MAE':>12} {'MSE':>12} "
+          f"{'PSNR (dB)':>12} {'Phys Res':>12}")
+    print("-" * 82)
+    for r in results:
+        print(f"{r['method']:<18} {r['max_error']:>12.3e} {r['mean_error']:>12.3e} "
+              f"{r['mse']:>12.3e} {r['psnr']:>12.1f} {r['phys_residual']:>12.3e}")
 
-    # Summary
-    print("\nResults summary:")
-    print(f"{'Method':<20} {'Max error':<14} {'Mean error':<14} "
-          f"{'Rel error':<14} {'Phys residual'}")
-    print("-" * 76)
-    for r in sorted(results, key=lambda x: x['rel_error']):
-        print(f"{r['method']:<20} {r['max_error']:<14.3e} {r['mean_error']:<14.3e} "
-              f"{r['rel_error']:<14.3e} {r['phys_error']:.3e}")
 
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 def main():
-    eq = create_equation()
-    N  = 100
-    configs = build_kernel_matrices(N, eq)
+    verify_solution()
+
+    N      = 100
+    epochs = 3000
 
     results = []
-    for name, A, K in configs:
-        results.append(train(eq, A, K, name, N=N, epochs=5000))
+    for method in ['discrete', 'endpoint', 'midpoint']:
+        results.append(train(method, N=N, epochs=epochs))
 
-    plot_results(results, eq)
+    plot_results(results)
     print(f"\nFigures saved to: {output_folder}/")
 
 
